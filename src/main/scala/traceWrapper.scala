@@ -29,9 +29,11 @@ case class CFIUpdateInfo(
     val taken: Boolean,
     val misPred: Boolean,
     val pcycle: Long,
-    val hist: Long
+    val hist: Long,
+    val startAddr: Long,
+    val intoHist: Boolean
 ){
-    override def toString: String = f"cycle($cycle%d), isBr($isBr%b) pc($pc%x) taken($taken%b) mispred($misPred%b), pcycle($pcycle%d), hist($hist%d)\n"
+    override def toString: String = f"cycle($cycle%d), isBr($isBr%b) pc($pc%x) taken($taken%b) mispred($misPred%b), pcycle($pcycle%d), hist($hist%d), intoHist($intoHist%b)\n"
 }
 
 case class CFIPredInfo(
@@ -39,10 +41,18 @@ case class CFIPredInfo(
     val fetchpc: Long,
     val mask: Int,
     val brmask: Int,
-    val hist: Long,
-    val histPtr: Int
+    val hist: Long
 ){
     override def toString: String = f"cycle($cycle%d), fetchpc($fetchpc%x), mask(${mask.toBinaryString}%s)\n"
+}
+
+case class GeneralCFIInfo(
+    val pc: Long,
+    val cfiType: Int,
+    val target: Long,
+    val taken: Boolean
+) {
+    override def toString: String = f"pc: $pc, type: $cfiType, target: $target, taken: $taken"
 }
 
 // This is a wrapper of trace produced by XiangShan BPU update,
@@ -52,11 +62,17 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
     type Stats = HashMap [Long, Tuple2[List[Int], Boolean]]
 
     val cfiUpdatePattern = "cfi_update".r
-    val cfiUpdateInfoExtractPattern = raw"\[time= *([0-9]+)\].*isBr\(([0-1])\) pc\(([0-9|a-f]{10})\) taken\(([0-1])\) mispred\(([0-1])\) cycle\( *([0-9]+)\) hist\( *([0-9|a-f]+)\)".r.unanchored
-    val cfiPredInfoExtractPattern = raw"\[time= *([0-9]+)\].*cfi_pred: fetchpc\(([0-9|a-f]{10})\) mask\( *([0-9]+)\) brmask\( *([0-9]+)\) hist\(([0-9|a-f]+)\) histPtr\( *([0-9]+)\)".r.unanchored
+    val cfiUpdateInfoExtractPattern = raw"\[time= *([0-9]+)\].*isBr\(([0-1])\) pc\(([0-9|a-f]{10})\) taken\(([0-1])\) mispred\(([0-1])\) cycle\( *([0-9]+)\) hist\( *([0-9|a-f]+)\) startAddr\(([0-9|a-f]{10})\) AddIntoHist\(([0-1])\)".r.unanchored
+    val reducedCfiUpdateInfoExtractPattern = raw"\[time= *([0-9]+)\].*isBr\(([0-1])\) pc\(([0-9|a-f]{10})\) taken\(([0-1])\) mispred\(([0-1])\) cycle\( *([0-9]+)\) hist\( *([0-9|a-f]+)\)".r.unanchored
+    val cfiPredInfoExtractPattern = raw"\[time= *([0-9]+)\].*cfi_pred: fetchpc\(([0-9|a-f]{10})\) mask\( *([0-9]+)\) brmask\( *([0-9]+)\) hist\(([0-9|a-f]+)\)".r.unanchored
 
-    def dumbCFI = CFIUpdateInfo(0, false, 0, false, false, 0, 0)
-    def dumbPred = CFIPredInfo(0,0,0,0,0,0)
+    //                           pc           type      target     taken
+    val generalCfiPattern = raw"([0-9|a-f]+) ([0-4]) ([0-9|a-f]+) ([0-1])".r.unanchored
+    val warmUpFinishPattern = raw"--------20M--------".r.unanchored
+
+    def dumbCFI = CFIUpdateInfo(0, false, 0, false, false, 0, 0, 0, false)
+    def dumbPred = CFIPredInfo(0,0,0,0,0)
+    def dumbGeneralCFI = GeneralCFIInfo(0, 0, 0, false)
 
     def toBoolean(s: String): Boolean = 
         s match {
@@ -64,6 +80,9 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
             case "0" => false
             case _ => {println("toBoolean error"); false}
         }
+    def fromHex(s: String): Long = {
+        java.lang.Long.parseLong(s.trim().takeRight(11), 16)
+    }
 
     def reMatch(str: String, p: Regex) = p findAllMatchIn str
 
@@ -72,8 +91,12 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
 
     def getCFIUpdateInfo(u: String): Any = {
         u match {
-            case cfiUpdateInfoExtractPattern(cycle, isBr, pc, taken, misPred, pcycle, hist) =>
-                CFIUpdateInfo(cycle.toLong, toBoolean(isBr), java.lang.Long.parseLong(pc.trim(), 16), toBoolean(taken), toBoolean(misPred), pcycle.toLong, (new java.math.BigInteger(hist.trim(), 16)).longValue)
+            case cfiUpdateInfoExtractPattern(cycle, isBr, pc, taken, misPred, pcycle, hist, startAddr, intoHist) =>
+                CFIUpdateInfo(cycle.toLong, toBoolean(isBr), fromHex(pc), toBoolean(taken), toBoolean(misPred), pcycle.toLong,
+                    (new java.math.BigInteger(hist.trim(), 16)).longValue, fromHex(startAddr), toBoolean(intoHist))
+            case reducedCfiUpdateInfoExtractPattern(cycle, isBr, pc, taken, misPred, pcycle, hist) =>
+                CFIUpdateInfo(cycle.toLong, toBoolean(isBr), fromHex(pc), toBoolean(taken), toBoolean(misPred), pcycle.toLong,
+                    (new java.math.BigInteger(hist.trim(), 16)).longValue, 0, false)
             case cfiUpdatePattern() => { println(" not a valid cfi_update line" + u); dumbCFI }
             case _ => 0 // not related lines
         }
@@ -81,21 +104,42 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
 
     def getCFIPredInfo(u: String): Any = {
         u match {
-            case cfiPredInfoExtractPattern(cycle, fetchpc, mask, brmask, hist, histPtr) => {
+            case cfiPredInfoExtractPattern(cycle, fetchpc, mask, brmask, hist) => {
                 // println(f"pred info $u%s")
-                CFIPredInfo(cycle.toLong, java.lang.Long.parseLong(fetchpc.trim(), 16), mask.toInt, brmask.toInt, (new java.math.BigInteger(hist.trim(), 16)).longValue, histPtr.toInt)
+                CFIPredInfo(cycle.toLong, fromHex(fetchpc), mask.toInt, brmask.toInt, (new java.math.BigInteger(hist.trim(), 16)).longValue)
             }
             case _ => 0 // println(f"Unexpected pred info $u%s")
+        }
+    }
+
+    def getGeneralCfiInfo(u: String): Any = {
+        // println(u)
+        u match {
+            case generalCfiPattern(pc, ty, target, taken) => {
+                // println(pc, ty, target, taken)
+                GeneralCFIInfo(fromHex(pc), ty.toInt, fromHex(target), toBoolean(taken))
+            }
+            case warmUpFinishPattern() => {
+                println("warmupFinish")
+                u
+            }
+            case _ => {
+                println("dumb" + u)
+                dumbGeneralCFI
+            }
         }
     }
 
     def getCFIInfosFromFile(file: String, getInfo: String => Any): Iterator[Any] = getLines(file).map(getInfo(_))
     def getCFIInfosFromSource(s: scala.io.BufferedSource, getInfo: String => Any): Iterator[Any] = getLines(s).map(getInfo(_))
 
+    def getGeneralCfiInfosFromSource(s: scala.io.BufferedSource, getInfo: String => Any): Iterator[Any] = getLines(s).map(getInfo(_))
+
     def getCFIPredInfosFromFile(file: String)   = getCFIInfosFromFile(file, getCFIPredInfo)
     def getCFIUpdateInfosFromFile(file: String) = getCFIInfosFromFile(file, getCFIUpdateInfo)
     def getCFIPredInfosFromSource(s: scala.io.BufferedSource)   = getCFIInfosFromSource(s, getCFIPredInfo)
     def getCFIUpdateInfosFromSource(s: scala.io.BufferedSource) = getCFIInfosFromSource(s, getCFIUpdateInfo)
+    def getGeneralCFIInfosFromSource(s: scala.io.BufferedSource) = getGeneralCfiInfosFromSource(s, getGeneralCfiInfo)
 
     def getXSResult(file: String): (Int, Int, Int, Int) = {
         var numBr = 0
@@ -105,7 +149,7 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
         readFile[(Int, Int, Int, Int)](file, s => {
             val cfis = getCFIUpdateInfosFromSource(s)
             cfis.foreach {
-                case CFIUpdateInfo(cycle, isBr, _, _, misp, pcycle, hist) => {
+                case CFIUpdateInfo(cycle, isBr, _, _, misp, pcycle, hist,_,_) => {
                     numCFI += 1
                     if (isBr) {
                         numBr += 1
@@ -132,7 +176,7 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
                 if (!cfis.hasNext) acc
                 else {
                     cfis.next() match {
-                        case CFIUpdateInfo(_,isBr,pc,_,misPred,_,_) => {
+                        case CFIUpdateInfo(_,isBr,pc,_,misPred,_,_,_,_) => {
                             def bToI(mis: Boolean) = if (mis) 1 else 0
                             def makeStat = {
                                 if (acc.contains(pc)) {
@@ -184,29 +228,21 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
         readFile[Unit](file, s => {
             val cfis = getCFIUpdateInfosFromSource(s)
             cfis.foreach {
-                case CFIUpdateInfo(cycle, isBr, _, taken, misp, pcycle, hist) if (!error) => {
+                case CFIUpdateInfo(cycle, isBr, _, taken, misp, pcycle, hist, _, intoHist) if (!error) => {
                     if (pcycle != prevCycle) {
                         if (h != hist) {
-                            println(f"cycle $prevCycle%6d updated, hist is ${boolArrayToString(toBoolArray(h, 64))}%s, this cycle $cycle%d")
-                            println(f"                    , hist is ${boolArrayToString(toBoolArray(hist, 64))}%s")
+                            println(f"cycle $prevCycle%6d updated,  ref_hist is ${boolArrayToString(toBoolArray(h, 64))}%s, this cycle $cycle%d")
+                            println(f"                    , real_hist is ${boolArrayToString(toBoolArray(hist, 64))}%s")
                             error = true
                         }
-                        thisShifted = false
-                        if (isBr) {
+                        if (isBr && intoHist) {
                             h = (h << 1L) | (if (taken) 1L else 0L)
-                            thisShifted = true
                         }
                         prevCycle = pcycle
                     }
                     else {
-                        if (isBr) {
-                            if (!thisShifted) {
-                                h = (h << 1L) | (if (taken) 1L else 0L)
-                                thisShifted = true
-                            }
-                            else {
-                                if (taken) h |= 1L
-                            }
+                        if (isBr && intoHist) {
+                            h = (h << 1L) | (if (taken) 1L else 0L)
                         }
                         prevCycle = pcycle
                     }
@@ -223,18 +259,23 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
         var br_count = 0
         var incorrect = 0
         var incorrect_misp = 0
+        var total_misp = 0
         var unShifted = 0
-        val preds = mutable.HashMap[Long, (Long, Int)]()
+        val preds = mutable.HashMap[Long, Long]()
         readFile[Unit](file, su => {
             val cfi_update = getCFIUpdateInfosFromSource(su)
             readFile[Unit](file, sp => {
                 val cfi_pred = getCFIPredInfosFromSource(sp)        
                 cfi_update.foreach {
-                    case CFIUpdateInfo(cycle, isBr, _, _, misp, pcycle, hist) => {
-                        // println(f"pcycle is $pcycle%d")
-                        if (isBr) { br_count += 1 }
+                    case CFIUpdateInfo(cycle, isBr, _, _, misp, pcycle, hist, _, _) => {
+                        if (isBr) {
+                            br_count += 1
+                            if (misp) {
+                                total_misp += 1
+                            }
+                        }
                         if (preds.contains(pcycle)) {
-                            val correct = hist == preds(pcycle)._1
+                            val correct = hist == preds(pcycle)
                             if (!correct) {
                                 if (isBr) {
                                     incorrect += 1
@@ -242,18 +283,18 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
                                 }
                                 println(f"pcycle($pcycle%d)hist ${if (correct) "=" else "!="}%s predhist")
                                 println(f"update hist is ${boolArrayToString(toBoolArray(hist, 64))}%s")
-                                println(f"  pred hist is ${boolArrayToString(toBoolArray(preds(pcycle)._1, 64))}%s")
+                                println(f"  pred hist is ${boolArrayToString(toBoolArray(preds(pcycle), 64))}%s")
                             }
                         } else {
                             cfi_pred.find {
-                                case CFIPredInfo(c, _, _, _, _, _) => {
+                                case CFIPredInfo(c, _, _, _, _) => {
                                     // if (c < pcycle) { println(f"pred cycle $c%d dropped") }
                                     c == pcycle
                                 }
                                 case _ => false
                             } match {
-                                case Some(pred@CFIPredInfo(c, _, _, _, predhist, histPtr)) => {
-                                    preds(c) = (predhist, histPtr)
+                                case Some(pred@CFIPredInfo(c, _, _, _, predhist)) => {
+                                    preds(c) = predhist
                                     val correct = hist == predhist
                                     if (!correct) {
                                         if (isBr) {
@@ -266,7 +307,7 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
                                     }
                                 }
                                 case None => {
-                                    println(f"totally find $incorrect%d branch pred hist errors out of $br_count%d brs, $incorrect_misp%d of them are mispredicted")
+                                    println(f"totally find $incorrect%d branch pred hist errors out of $br_count%d brs, $incorrect_misp%d of them are mispredicted\ntotal mispred $total_misp")
                                     System.exit(0)
                                 }
                             }
@@ -274,7 +315,7 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
                     }
                     case _ =>
                 }
-                println(f"totally find $incorrect%d branch pred hist errors out of $br_count%d brs, $incorrect_misp%d of them are mispredicted")
+                println(f"totally find $incorrect%d branch pred hist errors out of $br_count%d brs, $incorrect_misp%d of them are mispredicted\ntotal mispred $total_misp")
             })
         })
 
@@ -285,7 +326,7 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
             val cfi_update = getCFIUpdateInfosFromSource(s)
             var c: Long = 0
             cfi_update.foreach {
-                case CFIUpdateInfo(cycle, isBr, _, _, misp, pcycle, hist) => {
+                case CFIUpdateInfo(cycle, isBr, _, _, misp, pcycle, hist, _, _) => {
                     if (pcycle < c) {
                         println(f"disorder detected at cycle $cycle")
                     }
@@ -296,6 +337,32 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
         })
     }
 
+    def getUpdateLatencyStat(file: String) = {
+        val emptyStat = Array.fill(100)(0)
+        val stat = readFile(file, s => {
+            val stat = Array.fill(100)(0)
+            val cfis = getCFIUpdateInfosFromSource(s)
+            cfis.foreach{cfi => cfi match {
+                case CFIUpdateInfo(ucycle, isBr, _, _, _, pcycle, _, _, _) => {
+                    val latency = (ucycle - pcycle).toInt
+                    stat(latency) = stat(latency) + 1
+                }
+                case _ =>
+            }}
+            stat
+        }).getOrElse(emptyStat)
+        var totalLat = 0
+        val totalNum = stat.reduce(_+_)
+        stat.zipWithIndex.foreach { case (num, lat) => {
+            if (num > 0) {
+                totalLat += num * lat
+            }
+            println(f"latency[$lat%3d] -> $num")
+        }}
+        val averageLat = totalLat / totalNum
+        println(f"average commit latency is $averageLat")
+    }
+
     def transformLogToCsv(file: String) = {
         readFile[Unit](file, s => {
             val cfi_update = getCFIUpdateInfosFromSource(s)
@@ -303,7 +370,7 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
             writeToFile("/home/glr/scalaTage/branch_record/"+name+".csv", w => {
                 cfi_update.foreach {
                     // _ => w.write("yes")
-                    case CFIUpdateInfo(_, isBr, pc, taken, _, pcycle, _) => {
+                    case CFIUpdateInfo(_, isBr, pc, taken, _, pcycle, _, _, _) => {
                         // print("%x,%d,%d\n".format(pc, taken, isBr) )
                         if (isBr) w.write(f"$pc%x,${if(taken) 1 else 0}%d,${if(isBr) 1 else 0}%d\n")
                     }
@@ -328,12 +395,24 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
 
 
 
-object WrapperTest{
-    def main(args: Array[String]): Unit = {
-        val tw = new TraceWrapper
-        val file = "/home/glr/xs_alt/XiangShan/debug/coremark_sfb_test.log"
-        tw.printXSStats(file)
-        // tw.getCFIInfosFromFile(file).foreach(println)
-    }
-}
+// object WrapperTest{
+//     def main(args: Array[String]): Unit = {
+//         val tw = new TraceWrapper
+//         // val file = "/home/glr/xs_alt/XiangShan/debug/coremark10.log"
+//         val file = "/home/glr/XiangShan/cfi.log"
+//         val files = List(/* "/vulnerable/zjr/cfi1.log", 
+//                          "/vulnerable/zjr/cfi2.log", */
+//                           "/home/glr/XiangShan/debug/microbench_debug.log"/* ,
+//                          "/home/glr/xs_third/XiangShan/core_bigdate_o2_new_f4.log",
+//                          "/home/glr/XiangShan/debug/coremark_sc.log" */)
+//         // tw.printXSStats(file)
+//         files.foreach {f => {
+//             tw.printXSStats(f)
+//             tw.getXSResult(f)
+//             // tw.getUpdateLatencyStat(f)
+//         }}
+//         // tw.getCFIInfosFromFile(file).foreach(println)
+//         // tw.checkHist(file)
+//     }
+// }
 

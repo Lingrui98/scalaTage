@@ -9,6 +9,7 @@ import scala.math._
 import scala.util._
 import sys.process._
 import java.io.File
+import sys._
 
 trait ArgParser {
     val usage = """
@@ -26,7 +27,8 @@ trait ArgParser {
         if (args.length == 0) println(usage)
         val arglist = args.toList
 
-        def fileToPathInDebug(file: String) = "/home/glr/XiangShan/debug/" + file + ".log"
+        def fileToPathInDebug(file: String) = env("NOOP_HOME") + "/debug/" + file + ".log"
+        def fileToPath(file: String) = env("NOOP_HOME") + "/" + file + ".log"
         @scala.annotation.tailrec
         def nextOption(map : OptionMap, list: List[String]) : OptionMap = {
             def isSwitch(s : String)= (s(0) == '-')
@@ -34,6 +36,10 @@ trait ArgParser {
                 case Nil => map
                 case "--log-in-debug" :: file :: tail => 
                     nextOption(map ++ Map('file -> fileToPathInDebug(file)), tail)
+                case "--log" :: file :: tail =>
+                    nextOption(map ++ Map('file -> fileToPath(file)), tail)
+                case "--raw" :: file :: tail =>
+                    nextOption(map ++ Map('file -> file), tail)
                 case "--run-cputest" :: tail =>
                     nextOption(map ++ Map('multipleFiles -> getLogs("/home/glr/nexus-am/tests/cputest/build/")), tail)
                 case "--his" :: value :: tail =>
@@ -50,6 +56,16 @@ trait ArgParser {
                     nextOption(map ++ Map('useXS -> true), tail)
                 case "--useSC" :: tail =>
                     nextOption(map ++ Map('useStatisticalCorrector -> true), tail)
+                case "--tageCtrBits" :: value :: tail =>
+                    nextOption(map ++ Map('tageCtrBits -> value.toInt), tail)
+                case "-t" :: threads :: tail =>
+                    nextOption(map ++ Map('threads -> threads.toInt), tail)
+                case "--hist-lengths" :: h :: tail => {
+                    // println(h)
+                    val hlArr = h.split(",").map(_.toInt)
+                    // println(hlArr.mkString)
+                    nextOption(map ++ Map('hl -> hlArr), tail)
+                }
                 // case string :: opt2 :: tail if isSwitch(opt2) => 
                 //                     nextOption(map ++ Map('infile -> string), list.tail)
                 // case string :: Nil =>  nextOption(map ++ Map('infile -> string), list.tail)
@@ -60,7 +76,7 @@ trait ArgParser {
         // if (!ops.contains('file))
         //     ops ++ Map('file -> fileToPathInDebug("dhrystone"))
         // else
-            ops
+        ops
     }
 }
 
@@ -89,8 +105,9 @@ class BranchPredictorRunner() extends RunnerUtils with ArgParser with FileIOUtil
 
     def getCfiPreds(s: scala.io.BufferedSource): Iterator[Any]   = tw.getCFIPredInfosFromSource(s)
     def getCfiUpdates(s: scala.io.BufferedSource): Iterator[Any] = tw.getCFIUpdateInfosFromSource(s)
+    def getGeneralCfiInfos(s: scala.io.BufferedSource): Iterator[Any] = tw.getGeneralCFIInfosFromSource(s)
 
-    def dumbCFI = CFIUpdateInfo(0, false, 0, false, false, 0, 0)
+    def dumbCFI = CFIUpdateInfo(0, false, 0, false, false, 0, 0, 0, false)
 
     def getAndPrintPreds(stats: Stats): (Int, Int, Int) = {
         var brPrint = 0
@@ -110,33 +127,55 @@ class BranchPredictorRunner() extends RunnerUtils with ArgParser with FileIOUtil
     
     @scala.annotation.tailrec
     private def consumeCFI(stats: Stats, it: Iterator[Any])(implicit bp: BasePredictor): Stats = {
-        if (it.hasNext) {
-            it.next() match {
-                case CFIUpdateInfo(cycle, isBr, pc, taken, misPred, pcycle, _) => {
-                    // we only care about branches
-                    bp.predict(pc, isBr)
-                    if (isBr) {
-                        val mispred = bp.update(pc, taken)
-                        val l = 
-                            if (mispred) {
-                                if (stats.contains(pc)) List(stats(pc)(0) + 1, stats(pc)(1))
-                                else List(1, 0)
-                            }
-                            else {
-                                if (stats.contains(pc)) List(stats(pc)(0), stats(pc)(1) + 1)
-                                else List(0, 1)
-                            }
-                        consumeCFI(stats + ((pc, l)), it)
+        def onCFI(pc: Long, isBr: Boolean, taken: Boolean): Option[Tuple2[Long, List[Int]]] = {
+            bp.predict(pc, isBr)
+            if (isBr) {
+                val mispred = bp.update(pc, taken)
+                val l = 
+                    if (mispred) {
+                        if (stats.contains(pc)) List(stats(pc)(0) + 1, stats(pc)(1))
+                        else List(1, 0)
                     }
                     else {
-                        bp.updateUncond(pc)
+                        if (stats.contains(pc)) List(stats(pc)(0), stats(pc)(1) + 1)
+                        else List(0, 1)
+                    }
+                Some((pc, l))
+            } else {
+                bp.updateUncond(pc)
+                None
+            }
+        }
+        def emptyStats = HashMap[Long, List[Int]]()
+
+        if (it.hasNext) {
+            it.next() match {
+                case CFIUpdateInfo(cycle, isBr, pc, taken, misPred, pcycle, _, _, _) => {
+                    val newStat = onCFI(pc, isBr, taken)
+                    if (newStat.isDefined) {
+                        consumeCFI(stats + newStat.get, it)
+                    } else {
                         consumeCFI(stats, it)
                     }
+                }
+                case GeneralCFIInfo(pc, ty, target, taken) => {
+                    val newStat = onCFI(pc, ty == 0, taken)
+                    if (newStat.isDefined) {
+                        consumeCFI(stats + newStat.get, it)
+                    } else {
+                        consumeCFI(stats, it)
+                    }
+                }
+                case "--------20M--------" => { // warm up finishes, reset stats
+                    consumeCFI(emptyStats, it)
                 }
                 case _ => consumeCFI(stats, it)
             }
         }
-        else stats
+        else {
+            println("ends")
+            stats
+        }
     }
 
     def runWithCFIInfo(cfis: Iterator[Any])(implicit bp: BasePredictor) = {
@@ -145,6 +184,7 @@ class BranchPredictorRunner() extends RunnerUtils with ArgParser with FileIOUtil
         val pQ  = Queue[PcycleQueueElem]()
 
         val stats = consumeCFI(emptyStats, cfis)
+        bp.onFinish
 
         println(f"Printing top $maxBrPrint%d mispredicted branches:")
 
@@ -163,6 +203,7 @@ class BranchPredictorRunner() extends RunnerUtils with ArgParser with FileIOUtil
         if (l.exists()) {
             println(s"processing log $l")
             val res = readFile[(Int, Int)](log, s => runWithCFIInfo(getCfiUpdates(s))).get//OrElse((1,1))
+            // val res = readFile[(Int, Int)](log, s => runWithCFIInfo(getGeneralCfiInfos(s))).get//OrElse((1,1))
             (log, res)
         }
         else {
@@ -174,9 +215,13 @@ class BranchPredictorRunner() extends RunnerUtils with ArgParser with FileIOUtil
     def runWithLogs(logs: Array[String])(implicit bp: BasePredictor): Array[(String, (Int, Int))] = logs.map(runWithLog(_)).toArray
 
     def printRes(res: Array[(String, (Int, Int))]) = {
+        var mr = 100.0
         res.foreach { case(l, (c, m)) => {
-            println(f"test: ${l.split('/').last}%20s, $m%6d/${c+m}%8d mispredicted, missrate: ${(m*100).toDouble/(c+m)}%3.3f%%")
+            val missrate = (m*100).toDouble/(c+m)
+            println(f"test: ${l.split('/').last}%20s, $m%6d/${c+m}%8d mispredicted, missrate: ${missrate}%3.3f%%")
+            mr = missrate
         }}
+        mr
     }
 
     def checkOps(ops: OptionMap) = {
@@ -192,7 +237,7 @@ class BranchPredictorRunner() extends RunnerUtils with ArgParser with FileIOUtil
         checkOps(ops)
         val res = 
             if (ops.contains('file)) {
-                tw.getXSResult(ops('file).toString)
+                // tw.getXSResult(ops('file).toString)
                 Array(runWithLog(ops('file).toString))
             }
             else if (ops.contains('multipleFiles)) {
@@ -205,14 +250,15 @@ class BranchPredictorRunner() extends RunnerUtils with ArgParser with FileIOUtil
                 Array(runWithLog(defaultInput))
             }
         printRes(res)
-        
     }
 }
 
-// object BranchPredictorRunnerTest extends RunnerUtils with ArgParser {
-//     def main(args: Array[String]): Unit = {
-//         val options = parse(args)
-//         val bpr = new BranchPredictorRunner()
-//         bpr.run(options)
-//     }
-// }
+object BranchPredictorRunnerTest extends RunnerUtils with ArgParser {
+    def main(args: Array[String]): Unit = {
+        val options = parse(args)
+        println(options.mkString)
+        val bpr = new BranchPredictorRunner()
+        val mr = bpr.run(options)
+        println(mr)
+    }
+}

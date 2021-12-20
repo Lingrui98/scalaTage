@@ -95,6 +95,8 @@ class PerceptronBP()(implicit val p: PerceptronParams) extends BasePredictor {
         }
     }
 
+    def onFinish() = {}
+
     def name: String = "PERCEPTRON_BP"
     override def toString: String = f"${this.name}%s with params: \n${p}%s\nUsing global history ${if(updateOnUncond) "with" else "without"}%s jumps\n"
 }
