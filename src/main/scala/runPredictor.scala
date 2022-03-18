@@ -56,6 +56,10 @@ trait ArgParser {
                     nextOption(map ++ Map('useXS -> true), tail)
                 case "--useSC" :: tail =>
                     nextOption(map ++ Map('useStatisticalCorrector -> true), tail)
+                case "--useBimAsAlt" :: tail =>
+                    nextOption(map ++ Map('useBimAsAlt -> true), tail)
+                case "--numAlloc" :: value :: tail =>
+                    nextOption(map ++ Map('numAlloc -> value.toInt), tail)
                 case "--tageCtrBits" :: value :: tail =>
                     nextOption(map ++ Map('tageCtrBits -> value.toInt), tail)
                 case "-t" :: threads :: tail =>

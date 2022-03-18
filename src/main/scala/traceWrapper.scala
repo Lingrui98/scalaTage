@@ -395,24 +395,25 @@ class TraceWrapper() extends PredictorUtils with FileIOUtils {
 
 
 
-// object WrapperTest{
-//     def main(args: Array[String]): Unit = {
-//         val tw = new TraceWrapper
-//         // val file = "/home/glr/xs_alt/XiangShan/debug/coremark10.log"
-//         val file = "/home/glr/XiangShan/cfi.log"
-//         val files = List(/* "/vulnerable/zjr/cfi1.log", 
-//                          "/vulnerable/zjr/cfi2.log", */
-//                           "/home/glr/XiangShan/debug/microbench_debug.log"/* ,
-//                          "/home/glr/xs_third/XiangShan/core_bigdate_o2_new_f4.log",
-//                          "/home/glr/XiangShan/debug/coremark_sc.log" */)
-//         // tw.printXSStats(file)
-//         files.foreach {f => {
-//             tw.printXSStats(f)
-//             tw.getXSResult(f)
-//             // tw.getUpdateLatencyStat(f)
-//         }}
-//         // tw.getCFIInfosFromFile(file).foreach(println)
-//         // tw.checkHist(file)
-//     }
-// }
+object WrapperTest{
+    def main(args: Array[String]): Unit = {
+        val tw = new TraceWrapper
+        // val file = "/home/glr/xs_alt/XiangShan/debug/coremark10.log"
+        val file = "/home/glr/XiangShan/cfi.log"
+        // val file = "/bigdata/glr/ras_debug_cfi.log"
+        val files = List(/* "/vulnerable/zjr/cfi1.log", 
+                         "/vulnerable/zjr/cfi2.log", */
+                          "/bigdata/glr/ras_debug_cfi.log"/* ,
+                         "/home/glr/xs_third/XiangShan/core_bigdate_o2_new_f4.log",
+                         "/home/glr/XiangShan/debug/coremark_sc.log" */)
+        // tw.printXSStats(file)
+        files.foreach {f => {
+            tw.printXSStats(f)
+            tw.getXSResult(f)
+            // tw.getUpdateLatencyStat(f)
+        }}
+        // tw.getCFIInfosFromFile(file).foreach(println)
+        // tw.checkHist(file)
+    }
+}
 

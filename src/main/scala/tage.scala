@@ -4,6 +4,7 @@ import scala.collection.mutable
 // import scala.collection.immutable._
 import scala.math._
 import scala.util._
+import scala.util.Random
 
 
 case class TageParams (
@@ -29,6 +30,8 @@ case class TageParams (
     val SuperScalar: Boolean = false,
     val useGem5: Boolean = false,
     val useStatisticalCorrector: Boolean = false,
+    val useBimAsAlt: Boolean = false,
+    val numAlloc: Int = 1,
     val sct: Seq[Tuple2[Int, Int]] = Seq.fill(4)((1024,6)),
     val TageCtrBits: Int = 3
     )
@@ -40,7 +43,7 @@ case class TageParams (
 
     val TageTableBits = TableInfo.map { case (s, h, t) => s * (1+t+TageCtrBits+1) }.reduce(_+_)
     val TotalBits: Int =
-        TageTableBits + TageTableBits/2 + BimEntries + BimEntries / (1 << BimRatio) +
+        TageTableBits + BimEntries + BimEntries / (1 << BimRatio) +
         (if (useStatisticalCorrector) sct.length * sct(0)._1 * 2 * sct(0)._2 else 0)
 
     override def toString: String = TableInfo.zipWithIndex.map {case((r, h, t),i) => {f"TageTable[$i%d]: $r%3d rows, $h%3d bits history, $t%2d bits tag\n"}}.reduce(_+_) +
@@ -170,7 +173,7 @@ class TageTable (val numRows: Int, val histLen: Int, val tagLen: Int, val uBitPe
             (((pc >>> 1) ^ ((pc >>> 1) >>> (abs(log2Up(nRows)-i)+2)) ^ idxHist) & rowMask).toInt
         else
             // (((pc >>> 1) ^ ((pc >>> 1) >>> (abs(log2Up(nRows)-i)+2)) ^ (idxHist << 2)) & rowMask).toInt
-            (((getUnhashedIdx(pc) >>> 2) ^ (idxHist << 2)/*  ^ phist */) & rowMask).toInt
+            ((getUnhashedIdx(pc) ^ idxHist/*  ^ phist */) & rowMask).toInt
     
     private def getTag(pc: Long, tagHist: List[Int]): Int = {
         assert(tagHist.length == 2)
@@ -193,11 +196,11 @@ class TageTable (val numRows: Int, val histLen: Int, val tagLen: Int, val uBitPe
         //     // println(f"bankTemp $bankTemp conflict")
         //     bankTemp = (bankTemp + 1) & 3
         // }
-        val newIdx = ((idx & 0xfffffc) | bankTemp) & rowMask
-        val e = if (SuperScalar) tables(bank)(newIdx) else table(newIdx)
+        // val newIdx = ((idx & 0xfffffc) | bankTemp) & rowMask
+        val e = if (SuperScalar) tables(bank)(idx) else table(idx)
         // println(f"in lookup table_$i ", lastBanks(1), lastBanks(0), idx & 3, bankTemp)
-        lastBanks(1) = lastBanks(0)
-        lastBanks(0) = bankTemp
+        // lastBanks(1) = lastBanks(0)
+        // lastBanks(0) = bankTemp
         // println(f"after lookup table$i ", lastBanks(1), lastBanks(0), idx & 3, bankTemp)
         TableResp(e.ctr, e.u, tag == e.tag && e.valid, bankTemp)
     }
@@ -210,14 +213,14 @@ class TageTable (val numRows: Int, val histLen: Int, val tagLen: Int, val uBitPe
         val idxHist = fhist(0)
         val tagHist = List(fhist(1), fhist(2))
         val (bank, idx, tag) = getBIT(pc, idxHist, tagHist, phist)
-        val previousBank = ((pc >> 1) & 3).toInt
-        var realBank = previousBank
-        b.map(realBank = _)
-        val newIdx = ((idx & 0xfffffc) | realBank) & rowMask
+        // val previousBank = ((pc >> 1) & 3).toInt
+        // var realBank = previousBank
+        // b.map(realBank = _)
+        // val newIdx = ((idx & 0xfffffc) | realBank) & rowMask
         // println(f"in update table_$i ", previousBank, realBank, if (previousBank != realBank) "conflicted" else "")
         if (valid) {
             val newCtr = if (alloc) {if (taken) 1 << (TageCtrBits-1) else (1 << (TageCtrBits-1)) - 1} else ctrUpdate(oldCtr, taken)
-            val targetEntry = if (SuperScalar) tables(bank)(newIdx) else table(newIdx)
+            val targetEntry = if (SuperScalar) tables(bank)(idx) else table(idx)
             targetEntry.valid = true
             targetEntry.tag   = tag
             targetEntry.ctr   = newCtr
@@ -225,8 +228,8 @@ class TageTable (val numRows: Int, val histLen: Int, val tagLen: Int, val uBitPe
         }
 
         if (uValid) {
-            if (SuperScalar) tables(bank)(newIdx).u = u
-            else             table(newIdx).u = u
+            if (SuperScalar) tables(bank)(idx).u = u
+            else             table(idx).u = u
             // printf(f"updating u of bank $bank%d, idx $idx%d to $u%d\n")
         }
     }
@@ -305,6 +308,8 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
     val UseSC        = params.useStatisticalCorrector
     val SCConfigs    = params.sct
     val SCThresInit  = params.scThresInit
+    val UseBimAsAlt  = params.useBimAsAlt
+    val AllocTables  = params.numAlloc
 
     val scNumTables = SCConfigs.length
     // Use the same history length as TAGE tables
@@ -333,6 +338,8 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
 
     // ------------------------------------ perf counters ------------------------------------//
     val perTableNumHits = Array.fill(tables.length)(0)
+    val perTableNumUpdates = Array.fill(tables.length)(0)
+    val perTableNumAllocs = Array.fill(tables.length)(0)
     val perTableHitCorrects = Array.fill(tables.length)(0)
     val perTableHitMispreds = Array.fill(tables.length)(0)
     val perTableAltCorrects = Array.fill(tables.length)(0)
@@ -344,6 +351,12 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
     var useBim = 0
     var bimCorrect = 0
     var bimWrong = 0
+    var bimAsAlt = 0
+    var bimAltCorrect = 0
+    var bimAltWrong = 0
+    var altUsed = 0
+    var altCorrect = 0
+    var altWrong = 0
 
 
     case class TageMeta(
@@ -380,7 +393,7 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
 
     def predict(pc: Long, isBr: Boolean): Boolean = {
 
-        def tagePredict(tageResp: List[TableResp], bimResp: Boolean): (Boolean, Int, Int, Boolean, Boolean, Int, Int) = {
+        def tagePredict(tageResp: List[TableResp], bimResp: Boolean): (Boolean, Int, Int, Boolean, Boolean, Boolean, Int, Int) = {
             // @scala.annotation.tailrec
             // def tageCalRes(tResp: List[TableResp], ti: Int, provided: Boolean, provider: Int,
             //     altPred: Boolean, finalAltPred: Boolean, res: Boolean): (Boolean, Int, Boolean, Boolean, Boolean) = {
@@ -408,6 +421,7 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
             var providerRes = bimResp
 
             var altProvider = 0
+            var altProvided = false
 
             var altPred = bimResp
             var finalAltPred = bimResp
@@ -424,21 +438,28 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
                 }
             }
             break = false
-            if (provided && provider > 0) {
+            if (UseBimAsAlt) {
+                altPred = bimResp
+                finalAltPred = bimResp
+                altProvider = 0
+                altProvided = true
+            } else if (provided && provider > 0) {
                 for (i <- provider-1 to 0 by -1 if !break) {
                     val resp = respArr(i)
                     if (resp.hit) {
                         altPred = resp.ctr >= (1 << (TageCtrBits-1))
                         finalAltPred = resp.ctr >= (1 << (TageCtrBits-1))
                         altProvider = i
+                        altProvided = true
                         break = true
                     }
                 }
             }
+
             if (providerCtr == (1 << (TageCtrBits-1)) - 1 || providerCtr ==  (1 << (TageCtrBits-1))) {
-                (provided, provider, altProvider, finalAltPred, finalAltPred, respArr(provider).bank, respArr(altProvider).bank)
+                (provided, provider, altProvider, finalAltPred, finalAltPred, altProvided, respArr(provider).bank, respArr(altProvider).bank)
             } else {
-                (provided, provider, altProvider, finalAltPred, providerRes, respArr(provider).bank, respArr(altProvider).bank)
+                (provided, provider, altProvider, finalAltPred, providerRes, altProvided, respArr(provider).bank, respArr(altProvider).bank)
             }
 
         }
@@ -490,11 +511,11 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
             }
             val bimResp: Boolean = bim.lookUp(pc)
 
-            val (provided, provider, altProvider, finalAltPred, tageRes, providerBank, altProviderBank) = tagePredict(tageTableResps.toList, bimResp)
+            val (provided, provider, altProvider, finalAltPred, tageRes, altProvided, providerBank, altProviderBank) = tagePredict(tageTableResps.toList, bimResp)
             val providerU = tageTableResps(provider).u
             val providerCtr = tageTableResps(provider).ctr
             val altProviderCtr = tageTableResps(altProvider).ctr
-            val altProviderValid = tageTableResps(altProvider).hit
+            val altProviderValid = altProvided
             val altDiffers = tageRes != finalAltPred
             // val (allocEntry, allocated) = tageAlloc(tageTableResps.toList, provider, provided)
             // val (altAllocEntry, altAllocated) = tageAlloc(tageTableResps.toList, provider, provided)
@@ -568,9 +589,33 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
                 tables(tageMeta.pvdr).pvdrUpdate(pc, taken, tageMeta.pvdrCtr, 
                     if(tageMeta.altDiff) satUpdate(!misPred, tageMeta.pvdrU, 2) else tageMeta.pvdrU,
                     tageHists.foldedHists(tageMeta.pvdr), tageHists.pHist, tageMeta.pvdrBank)
-                if (misPred && tageMeta.altPvdrValid && (tageMeta.pvdrCtr == (1 << (TageCtrBits-1)) - 1 || tageMeta.pvdrCtr == (1 << (TageCtrBits-1)))) {
-                    tables(tageMeta.altPvdr).update(pc, true, taken, false, tageMeta.altPvdrCtr, false, 0,
-                        tageHists.foldedHists(tageMeta.pvdr), tageHists.pHist, Some(tageMeta.altPvdrBank))
+                perTableNumUpdates(tageMeta.pvdr) += 1
+                val useAlt = tageMeta.pvdrCtr == (1 << (TageCtrBits-1)) - 1 || tageMeta.pvdrCtr == (1 << (TageCtrBits-1))
+                if (misPred && tageMeta.altPvdrValid && useAlt) {
+                    if (!UseBimAsAlt) {
+                        tables(tageMeta.altPvdr).update(pc, true, taken, false, tageMeta.altPvdrCtr, false, 0,
+                            tageHists.foldedHists(tageMeta.pvdr), tageHists.pHist, Some(tageMeta.altPvdrBank))
+                        perTableNumUpdates(tageMeta.altPvdr) += 1
+                    }
+                }
+
+                if (useAlt) {
+                    altUsed += 1
+                    // bimAsAlt += 1
+                    if (misPred) {
+                        altWrong += 1
+                    } else {
+                        altCorrect += 1
+                    }
+                    if (UseBimAsAlt || !tageMeta.altPvdrValid) {
+                        bimAsAlt += 1
+                        if (misPred) {
+                            bimAltWrong += 1
+                            bim.update(pc, taken)
+                        } else {
+                            bimAltCorrect += 1
+                        }
+                    }
                 }
 
                 perTableNumHits(tageMeta.pvdr) += 1
@@ -590,6 +635,7 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
                     }
                 }
             } else {
+                bim.update(pc, taken)
                 useBim += 1
                 if (misPred) {
                     bimWrong += 1
@@ -597,9 +643,9 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
                     bimCorrect += 1
                 }
             }
-            val pvdrUnconfButCorrect =
-                tageMeta.pvdrCtr == (1 << (TageCtrBits-1)) - 1 && !taken ||
-                tageMeta.pvdrCtr == (1 << (TageCtrBits-1)) &&  taken
+            val pvdrUnconfButCorrect = tageMeta.pvdrValid &&
+                (tageMeta.pvdrCtr == (1 << (TageCtrBits-1)) - 1 && !taken ||
+                tageMeta.pvdrCtr == (1 << (TageCtrBits-1)) &&  taken)
             if (misPred && !pvdrUnconfButCorrect) {
                 val idxHists = tageHists.foldedHists.map(h => h(0)).toList
                 // Debug(f"idxHist list length ${idxHists.length}")
@@ -608,8 +654,13 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
                 if (allocValid) {
                     val allocIndices = tageMeta.allocMask.zipWithIndex.filter(_._1).map(_._2)
                     // println(allocIndices)
-                    val allocatable = allocIndices.length
-                    allocIndices.take(2).map(i => tables(i).allocUpdate(pc, taken, tageHists.foldedHists(i), tageHists.pHist))
+                    val chosen = (0 until AllocTables).map(_ => allocIndices(Random.nextInt(allocIndices.size))) // Maybe duplicates
+                    // val allocatable = allocIndices.length
+                    val deDup = chosen.toSet.toList
+                    deDup.map(i => {
+                        tables(i).allocUpdate(pc, taken, tageHists.foldedHists(i), tageHists.pHist)
+                        perTableNumAllocs(i) += 1
+                    })
                 }
                 else {
                     (0 until TageNTables).foreach(i => if (i > tageMeta.pvdr) tables(i).decrementU(pc, idxHists(i), pHist))
@@ -641,9 +692,9 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
                 if (scPred != tagePred) {
                     // println(f"scPred != taken, sum $sumAbs use $thres ")
                     
-                    if (sumAbs <= thresVal - 2 && sumAbs >= thresVal - 4) {
+                    // if (sumAbs <= thresVal - 2 && sumAbs >= thresVal - 4) {
                         scThresholds.update(bank, thres.update(scPred != taken)) 
-                    }
+                    // }
                 }
                 // if (scPred == taken && sumAbs <= thres) {
                 //     scThreshold = scThreshold.update(false)
@@ -666,7 +717,7 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
             tageUpdate(meta, misPred)
             if (UseSC) { scUpdate(meta.scMeta, taken) }
             ghist.updateHist(taken)
-            bim.update(pc, taken)
+            // bim.update(pc, taken)
             updateFoldedHistories(taken, meta.histPtr)
             phist.update(pc)
             brCount += 1
@@ -683,8 +734,15 @@ class Tage(params: TageParams = TageParams()) extends BasePredictor {
     }
 
     def onFinish() = {
+        for (i <- 0 until tables.length) {
+            val updates = perTableNumUpdates(i)
+            val allocs = perTableNumAllocs(i)
+            println(f"tage table $i alloc $allocs%8s, update $updates%8s")
+        }
         println(s"sc correct tage: $scCorrectTage, sc wrongly revert tage: $scMisleadTage")
         println(f"bim used $useBim, correct $bimCorrect, wrong $bimWrong")
+        println(f"bim used as alt $bimAsAlt, correct $bimAltCorrect, wrong $bimAltWrong")
+        println(f"alt used $altUsed, correct $altCorrect, wrong $altWrong")
         for (i <- 0 until tables.length) {
             val tableHit = perTableNumHits(i)
             val hitCorrect = perTableHitCorrects(i)
@@ -733,14 +791,14 @@ object Tage {
                                    ( 1024,   32, 9),
                                    ( 1024,   65, 9)/* ,
                                    ( 1024,  10) */)
-                val xst: Seq[Tuple3[Int, Int, Int]]  = Seq(( 2048,   4,     9),
-                                                           ( 2048,   16,    9),
-                                                           ( 2048,   64,    9),
-                                                           ( 2048,   256,   9)/* ,
-                                                           ( 1024,   64,   9),
-                                                           ( 1024,   90,   9),
-                                                           ( 1024,   160,  9),
-                                                           ( 1024,   260,  9) */)
+                val xst: Seq[Tuple3[Int, Int, Int]]  = Seq(( 2048,   2,    7),
+                                                           ( 2048,   8,    7),
+                                                           ( 2048,   12,   8),
+                                                           ( 2048,   13,   8),
+                                                           ( 2048,   28,   9),
+                                                           ( 2048,   54,   9),
+                                                           ( 1024,   119,  10),
+                                                           (  512,   256,  11))
                 // val xst = previous
                 if (o.contains('hl)) {
                     val hArray = ops('hl).asInstanceOf[Array[Int]]
@@ -754,6 +812,15 @@ object Tage {
             case o if (o.contains('useStatisticalCorrector)) => {
                 println(f"Using statistical corrector")
                 wrapParams(ops - 'useStatisticalCorrector, p.copy(useStatisticalCorrector=true))
+            }
+            case o if (o.contains('useBimAsAlt)) => {
+                println(f"Using bim as alt")
+                wrapParams(ops - 'useBimAsAlt, p.copy(useBimAsAlt = true))
+            }
+            case o if (o.contains('numAlloc)) => {
+                val na = ops('numAlloc).asInstanceOf[Int]
+                println(f"num alloc $na")
+                wrapParams(ops - 'numAlloc, p.copy(numAlloc = na))
             }
             case o if (o.contains('tageCtrBits)) => {
                 println(f"tageCtrBits is ${ops('tageCtrBits)}")
